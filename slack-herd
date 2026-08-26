@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# Launch Herdr work from Slack @mentions.
+# This process only listens with --mentions. Launched agents listen on their
+# own thread via slackcli serve (shared Socket Mode fan-out).
+# Does not wait on the agent. Follow up in Herdr (`herd pending` / `herd ls`).
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: slack-herd [--cwd DIR] [--kind KIND] [CHANNEL...]
+
+Listen for Slack messages that mention the bot and start `herd new` for each
+one. CHANNEL is #name or a C/D/G id; with none, every conversation the bot is
+in is watched. Mentions only — no allowlist.
+
+This is one slackcli listen client (--mentions). Agents started from a
+mention listen on that thread (--thread TS). Both attach to slackcli serve,
+which holds the single Socket Mode connection.
+
+Cwd for each job is DIR/<channel>, where <channel> is the Slack channel name
+without '#'. Example: mention in #trinity → ~/Projects/trinity.
+
+  --cwd DIR    projects root (default: $SLACK_HERD_CWD or ~/Projects)
+  --kind KIND  herd --kind (default: $SLACK_HERD_KIND or claude)
+
+State (dedup by channel+ts): $SLACK_HERD_STATE_DIR or $XDG_DATA_HOME/slack-herd
+EOF
+}
+
+log() {
+  printf '%s %s\n' "$(date -Iseconds)" "$*" >&2
+}
+
+CWD="${SLACK_HERD_CWD:-$HOME/Projects}"
+KIND="${SLACK_HERD_KIND:-claude}"
+STATE="${SLACK_HERD_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/slack-herd}"
+channels=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --cwd)
+      CWD="${2:?--cwd requires a directory}"
+      shift 2
+      ;;
+    --kind)
+      KIND="${2:?--kind requires a value}"
+      shift 2
+      ;;
+    --)
+      shift
+      channels+=("$@")
+      break
+      ;;
+    -*)
+      printf 'slack-herd: unknown flag %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      channels+=("$1")
+      shift
+      ;;
+  esac
+done
+
+add_path() {
+  [[ -d "$1" ]] || return 0
+  case ":$PATH:" in
+    *":$1:"*) ;;
+    *) PATH="$1:$PATH" ;;
+  esac
+}
+
+# systemd --user PATH is thin; keep slackcli / herd reachable.
+add_path "$HOME/.local/bin"
+add_path "$HOME/go/bin"
+add_path "$HOME/Projects/herd-orchestrator-cli/bin"
+if [[ -d "$HOME/.local/share/mise/installs/go" ]]; then
+  for d in "$HOME/.local/share/mise/installs/go"/*/bin; do
+    add_path "$d"
+  done
+fi
+export PATH
+
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'slack-herd: %s not found on PATH\n' "$1" >&2
+    exit 1
+  fi
+}
+need slackcli
+need herd
+need jq
+
+if [[ ! -d "$CWD" ]]; then
+  printf 'slack-herd: cwd is not a directory: %s\n' "$CWD" >&2
+  exit 1
+fi
+
+mkdir -p "$STATE/seen"
+
+strip_mentions() {
+  sed -E 's/<@U[A-Z0-9]+(\|[^>]*)?>//g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+}
+
+slug() {
+  local s
+  s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/^-*//')
+  if [[ -z "$s" ]]; then
+    printf 'slack-mention'
+    return
+  fi
+  if [[ "$s" != [a-z]* ]]; then
+    s="s-$s"
+  fi
+  printf '%s' "${s:0:40}"
+}
+
+slack_reply() {
+  local channel=$1 thread=$2
+  shift 2
+  slackcli --json send "$channel" --thread "$thread" -- "$@" >/dev/null || true
+}
+
+thread_prompt() {
+  local channel=$1 thread=$2
+  local raw
+  if ! raw=$(slackcli --json get "$channel" "$thread" --replies 2>/dev/null); then
+    return 1
+  fi
+  jq -r '.[-20:] | .[] | "@\(.user_name // .user): \(.text // "")"' <<<"$raw"
+}
+
+project_from_channel() {
+  local name=$1
+  name=${name#\#}
+  case "$name" in
+    "" | */* | *..* | dm:* | D*)
+      return 1
+      ;;
+  esac
+  printf '%s' "$name"
+}
+
+handle() {
+  local line=$1
+  local channel ts thread text user_name channel_name prompt label seen err out ws name
+  local project job_cwd
+
+  channel=$(jq -r '.channel // empty' <<<"$line")
+  ts=$(jq -r '.ts // empty' <<<"$line")
+  if [[ -z "$channel" || -z "$ts" ]]; then
+    log "skip malformed event"
+    return 0
+  fi
+
+  seen="$STATE/seen/${channel}/${ts}"
+  mkdir -p "$(dirname "$seen")"
+  if ! mkdir "$seen" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$line" >"$seen/event.json"
+
+  thread=$(jq -r '.thread_ts // empty' <<<"$line")
+  [[ -z "$thread" ]] && thread=$ts
+  user_name=$(jq -r '.user_name // .user // "someone"' <<<"$line")
+  channel_name=$(jq -r '.channel_name // .channel' <<<"$line")
+  text=$(jq -r '.text // empty' <<<"$line" | strip_mentions)
+
+  # A mention that is a reply in a thread we already launched belongs to that
+  # agent (slackcli listen --thread). Do not start another herd job.
+  if [[ "$thread" != "$ts" && -f "$STATE/seen/${channel}/${thread}/space.json" ]]; then
+    log "thread follow-up $channel_name $thread (agent owns --thread)"
+    return 0
+  fi
+
+  if [[ -z "$text" ]]; then
+    log "empty mention in $channel_name $ts"
+    slack_reply "$channel" "$thread" "Mention me with a task."
+    return 0
+  fi
+
+  if ! project=$(project_from_channel "$channel_name"); then
+    log "no project mapping for $channel_name"
+    slack_reply "$channel" "$thread" "Use a project channel named like a directory under ${CWD}."
+    return 0
+  fi
+  job_cwd="$CWD/$project"
+  if [[ ! -d "$job_cwd" ]]; then
+    log "missing project dir $job_cwd"
+    slack_reply "$channel" "$thread" "No directory ${job_cwd} for ${channel_name}."
+    return 0
+  fi
+
+  label=$(slug "$text")
+  prompt=$(
+    cat <<EOF
+You were launched from a Slack mention. Do the task in this workspace.
+
+Before working, start a background listener for this thread only (do not block on it; slack-herd keeps watching mentions separately):
+
+  slackcli --json listen ${channel} --thread ${thread}
+
+That shares slackcli serve with other listeners. Always pass --thread so you only see replies here. Status is on stderr; events are JSONL on stdout. Reply in the thread with:
+
+  slackcli --json send ${channel} --thread ${thread} -- "your message"
+
+If you need the full thread:
+
+  slackcli --json get ${channel} ${thread} --replies
+
+Channel: ${channel_name} (${channel})
+Thread ts: ${thread}
+From: @${user_name}
+Directory: ${job_cwd}
+
+Task:
+${text}
+EOF
+  )
+  if thread_body=$(thread_prompt "$channel" "$thread"); then
+    if [[ -n "$thread_body" ]]; then
+      prompt+=$'\n\nThread (oldest first, last 20):\n'"$thread_body"
+    fi
+  fi
+
+  log "start $channel_name $ts cwd=$job_cwd label=$label"
+  err=$(mktemp)
+  if ! out=$(herd --json new --cwd "$job_cwd" --label "$label" --kind "$KIND" -- "$prompt" 2>"$err"); then
+    log "herd new failed: $(tr '\n' ' ' <"$err")"
+    slack_reply "$channel" "$thread" "herd new failed: $(tr '\n' ' ' <"$err")"
+    rm -f "$err"
+    return 0
+  fi
+  rm -f "$err"
+  printf '%s\n' "$out" >"$seen/space.json"
+  ws=$(jq -r '.workspace_id // empty' <<<"$out")
+  name=$(jq -r '.name // .label // empty' <<<"$out")
+  log "started $name $ws"
+  slack_reply "$channel" "$thread" "started in Herdr: ${name} (${ws})"
+}
+
+term() {
+  trap - INT TERM
+  jobs -p | xargs -r kill 2>/dev/null || true
+  wait 2>/dev/null || true
+  exit 0
+}
+trap term INT TERM
+
+log "listening mentions via slackcli serve projects=$CWD kind=$KIND ${channels[*]:-(all joined)}"
+while IFS= read -r line || [[ -n "${line:-}" ]]; do
+  [[ -z "${line:-}" ]] && continue
+  handle "$line" &
+done < <(slackcli --json listen --mentions "${channels[@]}")
+log "listen exited"
+wait
+exit 1

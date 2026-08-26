@@ -1,0 +1,14 @@
+[Unit]
+Description=Launch Herdr work from Slack mentions
+After=network-online.target slackcli-serve.service
+Wants=network-online.target slackcli-serve.service
+
+[Service]
+ExecStart=%h/.local/bin/slack-herd
+Restart=always
+RestartSec=3
+Environment=SLACK_HERD_CWD=%h/Projects
+
+[Install]
+WantedBy=default.target
+
